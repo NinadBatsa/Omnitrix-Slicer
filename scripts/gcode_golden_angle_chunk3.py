@@ -209,7 +209,7 @@ def centroid(segments):
     return (sx / total, sy / total) if total else (None, None)
 
 
-def read_slicer_settings(lines):
+def read_slicer_settings(lines, keys=REPORTED_SETTINGS):
     """Pick selected '; key = value' settings out of the slicer's config block."""
     found = {}
     for raw in lines[-2000:]:
@@ -217,7 +217,7 @@ def read_slicer_settings(lines):
         if not line.startswith("; ") or "=" not in line:
             continue
         key, value = line[2:].split("=", 1)
-        if key.strip() in REPORTED_SETTINGS:
+        if key.strip() in keys:
             found[key.strip()] = value.strip()
     return found
 
