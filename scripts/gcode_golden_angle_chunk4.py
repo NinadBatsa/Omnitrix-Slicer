@@ -142,37 +142,27 @@ def circular_mean_180(values):
     return mean, spread
 
 
-def cmd_verify(args):
-    cfg = resolve_config(args)
-    try:
-        with open(args.gcode, "r", encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
-    except OSError as exc:
-        print(f"Error: cannot read file: {exc}")
-        sys.exit(1)
+def verify_lines(lines, layers, cfg, tolerance):
+    """Compare the infill angles in already-read G-code with the schedule.
 
-    layers = split_layers(lines)
-    if not layers:
-        print("Error: no ;LAYER_CHANGE markers found — layer count is zero.")
-        sys.exit(1)
-
+    Returns a report dict: 'header', 'table' and 'summary' are lists of
+    printable lines; 'ok', 'checked', 'passed', 'skipped', 'warnings' and
+    'problems' carry the results for callers that act on them.
+    """
     settings = read_slicer_settings(lines, VERIFY_SETTINGS)
     infill, warnings = collect_infill(lines, len(layers))
     raft = int(settings.get("raft_layers", "0") or 0)
     object_layers = len(layers) - raft
     expected = schedule_line_angles(object_layers, cfg)
 
-    print(f"File:             {args.gcode}")
-    print(f"Layers:           {len(layers)} ({raft} raft + {object_layers} object)")
-    print(f"Material profile: {cfg['material_profile'] or 'none (config defaults)'}")
-    print(f"Tolerance:        ±{args.tolerance}°")
-    print("Seed value:       [TRADE SECRET — set in CONFIG block]")
+    header = [f"Layers:           {len(layers)} ({raft} raft + {object_layers} object)",
+              f"Tolerance:        ±{tolerance}°"]
 
     # --- Settings checks ---
     problems = []
     pattern = settings.get("sparse_infill_pattern")
     if pattern is not None:
-        print(f"Infill pattern:   {pattern}")
+        header.append(f"Infill pattern:   {pattern}")
         if pattern not in LINE_PATTERNS:
             problems.append(f"infill pattern '{pattern}' is not a single-direction line pattern; "
                             f"use one of: {', '.join(sorted(LINE_PATTERNS))}")
@@ -181,11 +171,11 @@ def cmd_verify(args):
                         "to every infill angle; turn it off")
     if raft:
         warnings.append(f"{raft} raft layers: assuming the template is indexed from the first "
-                        "object layer above the raft — check the results below")
+                        "object layer above the raft — check the per-layer results")
 
     file_template = settings.get("sparse_infill_rotate_template")
     if file_template is None:
-        print("Template in file: not found (no slicer config block in this file)")
+        header.append("Template in file: not found (no slicer config block in this file)")
     elif not file_template:
         problems.append("sparse_infill_rotate_template is empty — the file was not sliced "
                         "with the golden-angle template")
@@ -206,13 +196,13 @@ def cmd_verify(args):
                 problems.append("template in the file does not match this schedule — "
                                 "different seed, material profile or max variation?")
             else:
-                print(f"Template in file: matches schedule ({len(values)} angles, "
-                      f"offset {file_offset:+.2f}°)")
+                header.append(f"Template in file: matches schedule ({len(values)} angles, "
+                              f"offset {file_offset:+.2f}°)")
 
     # --- Per-layer measurement ---
-    print(f"\n{'Layer':>5}  {'Obj':>4}  {'Target':>7}  {'Measured':>8}  {'Error':>7}  "
-          f"{'Coher.':>6}  Status")
-    print("-" * 56)
+    table = [f"{'Layer':>5}  {'Obj':>4}  {'Target':>7}  {'Measured':>8}  {'Error':>7}  "
+             f"{'Coher.':>6}  Status",
+             "-" * 56]
     errors = []      # (layer index, signed error)
     skipped = []
     for layer, inf in zip(layers, infill):
@@ -223,52 +213,80 @@ def cmd_verify(args):
         measured, coherence = measure_refined(inf.segments)
         if measured is None:
             skipped.append((layer.index, "no sparse infill"))
-            print(f"{layer.index:>5}  {obj:>4}  {target:>6.2f}°  {'—':>8}  {'—':>7}  {'—':>6}  "
-                  "skip: no sparse infill")
+            table.append(f"{layer.index:>5}  {obj:>4}  {target:>6.2f}°  {'—':>8}  {'—':>7}  "
+                         f"{'—':>6}  skip: no sparse infill")
             continue
         if coherence < MIN_COHERENCE:
             skipped.append((layer.index, f"not parallel lines (coherence {coherence:.2f})"))
-            print(f"{layer.index:>5}  {obj:>4}  {target:>6.2f}°  {measured:>7.2f}°  {'—':>7}  "
-                  f"{coherence:>6.2f}  skip: not parallel lines")
+            table.append(f"{layer.index:>5}  {obj:>4}  {target:>6.2f}°  {measured:>7.2f}°  "
+                         f"{'—':>7}  {coherence:>6.2f}  skip: not parallel lines")
             continue
         err = signed_line_delta(measured, target)
         err = 0.0 if abs(err) < 0.005 else err   # avoid printing "-0.00"
         errors.append((layer.index, err))
-        status = "OK" if abs(err) <= args.tolerance else "OFF"
-        print(f"{layer.index:>5}  {obj:>4}  {target:>6.2f}°  {measured:>7.2f}°  {err:>+6.2f}°  "
-              f"{coherence:>6.2f}  {status}")
+        status = "OK" if abs(err) <= tolerance else "OFF"
+        table.append(f"{layer.index:>5}  {obj:>4}  {target:>6.2f}°  {measured:>7.2f}°  "
+                     f"{err:>+6.2f}°  {coherence:>6.2f}  {status}")
 
     # --- Summary ---
-    print("\nSummary")
     checked = len(errors)
-    passed = sum(1 for _, e in errors if abs(e) <= args.tolerance)
-    print(f"  Layers checked:  {checked}")
-    print(f"  Within ±{args.tolerance}°:    {passed}/{checked}")
+    passed = sum(1 for _, e in errors if abs(e) <= tolerance)
+    summary = [f"Layers checked:  {checked}",
+               f"Within ±{tolerance}°:    {passed}/{checked}"]
     if errors:
-        print(f"  Largest error:   {max(abs(e) for _, e in errors):.2f}°")
+        summary.append(f"Largest error:   {max(abs(e) for _, e in errors):.2f}°")
 
     if errors and passed < checked:
         offset, spread = circular_mean_180([e for _, e in errors])
         if spread <= OFFSET_SPREAD_MAX:
-            print(f"  All layers are off by the same {offset:+.2f}° (±{spread:.2f}°): the slicer "
-                  "adds a constant rotation to the template.")
-            print(f"  Fix: regenerate the template with --offset {-offset:.2f} and slice again.")
+            summary.append(f"All layers are off by the same {offset:+.2f}° (±{spread:.2f}°): "
+                           "the slicer adds a constant rotation to the template.")
+            summary.append(f"Fix: regenerate the template with --offset {-offset:.2f} "
+                           "and slice again.")
         else:
-            print("  Errors are not a constant offset — the template is probably not "
-                  "applied to every layer, or layers are indexed differently.")
+            summary.append("Errors are not a constant offset — the template is probably not "
+                           "applied to every layer, or layers are indexed differently.")
 
-    for idx, reason in skipped:
-        print(f"  Skipped layer {idx}: {reason}")
-    for w in warnings:
-        print(f"  Warning: {w}")
-    for p in problems:
-        print(f"  Problem: {p}")
-
-    ok = checked > 0 and passed == checked and not problems
+    summary += [f"Skipped layer {idx}: {reason}" for idx, reason in skipped]
+    summary += [f"Warning: {w}" for w in warnings]
+    summary += [f"Problem: {p}" for p in problems]
     if checked == 0:
-        print("  Warning: no layers with measurable sparse infill — nothing to verify.")
-    print(f"\nResult: {'PASS' if ok else 'FAIL'}")
-    sys.exit(0 if ok else 2)
+        summary.append("Warning: no layers with measurable sparse infill — nothing to verify.")
+
+    return {"header": header, "table": table, "summary": summary,
+            "ok": checked > 0 and passed == checked and not problems,
+            "checked": checked, "passed": passed, "skipped": skipped,
+            "warnings": warnings, "problems": problems}
+
+
+def cmd_verify(args):
+    cfg = resolve_config(args)
+    try:
+        with open(args.gcode, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError as exc:
+        print(f"Error: cannot read file: {exc}")
+        sys.exit(1)
+
+    layers = split_layers(lines)
+    if not layers:
+        print("Error: no ;LAYER_CHANGE markers found — layer count is zero.")
+        sys.exit(1)
+
+    report = verify_lines(lines, layers, cfg, args.tolerance)
+    print(f"File:             {args.gcode}")
+    print(f"Material profile: {cfg['material_profile'] or 'none (config defaults)'}")
+    print("Seed value:       [TRADE SECRET — set in CONFIG block]")
+    for line in report["header"]:
+        print(line)
+    print()
+    for line in report["table"]:
+        print(line)
+    print("\nSummary")
+    for line in report["summary"]:
+        print(f"  {line}")
+    print(f"\nResult: {'PASS' if report['ok'] else 'FAIL'}")
+    sys.exit(0 if report["ok"] else 2)
 
 
 # =============================================================================
